@@ -185,16 +185,10 @@ touch 1G and the original iPhone (white screen, see COMPATIBILITY.md). iOS 7 ski
   it to SpringBoard. Users need a new release to get it.
 - [x] Prepared-device (`.itbase`) import removed from every app, with `get-assets.py`: each app prepares from an
   IPSW it downloads (or the user chooses), with the boot ROM downloaded too, so nothing needs rehosting.
-- [ ] Jailbreak on the iPod touch 2G. A jailbroken 2G (3.1.3 checked, on main's firmwarekit too) starts once and then
-  never again: Cydia's Startup job installs Substrate from its AutoInstall folder on the first boot, Substrate's install
-  script writes `/etc/launchd.conf` (`bsexec .. /usr/bin/cynject 1 …/SubstrateLauncher.dylib`), and on every later
-  boot launchctl stops right after "Couldn't stat /etc/mach_init.d" (kernel `-v`: no further I/O, the engine near
-  idle). Without Substrate the same device restarts fine. The 3G, 4G, 3GS and iPhone 4 boot jailbroken kernels
-  (sandbox patch, `amfi_get_out_of_my_way`); the 2G's is stock with only the AMFI boot args. Until this is solved
-  the prepare screens show the Jailbreak switch locked on the 2G and firmwarekit refuses it. Dropping Substrate (and
-  HTTPatch, a Substrate extension) isn't enough on its own: on 3.x it_typein then goes back into SpringBoard's
-  `DYLD_INSERT_LIBRARIES`, which cydo refuses (see `cydia::install_jailbreak`), and a user installing Substrate from
-  Cydia would hang the device the same way.
+- [x] Jailbreak on the iPod touch 2G with iOS 3.1.3 (7E18): the device gets the contemporary jailbreak's patched
+  iBoot and kernel (`n72_jailbreak_patch`), which Substrate's launchd hook needs to boot again after the first start.
+  iBoot loads a kernelcache only when its uncompressed size plus stored payload fits in 15 MiB, so the rewrapped one is
+  LZSS-compressed. 4.2.1 (8C148) stays locked until its kernel has its own verified patch set.
 
 ## Cleanup
 

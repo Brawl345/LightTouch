@@ -137,9 +137,8 @@ impl Firmware {
     pub fn jailbreak_unavailable(&self) -> Option<&'static str> {
         if self.version.split('.').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0) < 2 {
             Some("Needs iPhone OS 2.0 or later")
-        } else if self.board == "n72ap" {
-            // Substrate's launchd hook (cynject from /etc/launchd.conf) hangs every boot after the first: docs/TODO.md.
-            Some("Not on iPod touch 2G yet: it wouldn't start up again after its first restart")
+        } else if self.board == "n72ap" && self.id != "n72ap-7E18" {
+            Some("Available on iPod touch 2G only with iOS 3.1.3")
         } else {
             None
         }
@@ -366,14 +365,14 @@ pub fn fits_device_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The Jailbreak switch is locked on 1.x and on the iPod touch 2G, and open on the boards that restart jailbroken.
+    /// The Jailbreak switch is locked on 1.x and unsupported iPod touch 2G builds.
     #[test]
     fn jailbreak_is_locked_where_it_cannot_work() {
         let catalog = Catalog::get();
         let reason = |id: &str| catalog.find(id).unwrap().jailbreak_unavailable();
         assert_eq!(reason("n45ap-4A102"), Some("Needs iPhone OS 2.0 or later"));
-        assert!(reason("n72ap-7E18").unwrap().contains("iPod touch 2G"));
-        assert!(reason("n72ap-8C148").unwrap().contains("iPod touch 2G"));
+        assert_eq!(reason("n72ap-7E18"), None);
+        assert!(reason("n72ap-8C148").unwrap().contains("iOS 3.1.3"));
         assert_eq!(reason("n81ap-10B500"), None);
         assert_eq!(reason("n90ap-11D257"), None);
     }

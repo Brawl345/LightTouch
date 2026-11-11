@@ -178,25 +178,11 @@ pub fn rewrap(raw: &[u8], patched: &[u8], iv: &[u8], key: &[u8]) -> Result<Vec<u
     rebuild_img3(raw, &cipher)
 }
 
-/// A valid Apple-LZSS stream of all literals (flag byte then eight bytes), so no compressor is needed: iBoot's
-/// decompressor reproduces the kernel. Larger than a real compression, which the system volume has room for.
-fn literal_lzss(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + data.len() / 8 + 1);
-    let mut i = 0;
-    while i < data.len() {
-        let n = (data.len() - i).min(8);
-        out.push(((1u16 << n) - 1) as u8); // n low bits set: n literals follow
-        out.extend_from_slice(&data[i..i + n]);
-        i += n;
-    }
-    out
-}
-
 /// The complzss container a decrypted kernelcache is (lzss::complzss reads it back): "complzss", adler32, ulen, clen
 /// big-endian in a 0x180 header, the LZSS body after it.
 fn complzss_wrap(kernel: &[u8]) -> Vec<u8> {
-    let body = literal_lzss(kernel);
-    let mut h = vec![0u8; 0x180];
+    let body = crate::lzss::compress(kernel);
+    let mut h = vec![0u8; crate::lzss::COMPLZSS_HEADER_SIZE];
     h[..8].copy_from_slice(b"complzss");
     let be = |h: &mut [u8], o: usize, v: u32| h[o..o + 4].copy_from_slice(&v.to_be_bytes());
     be(&mut h, 8, crate::lzss::adler32(kernel));
@@ -268,8 +254,8 @@ fn aes_cbc_encrypt(buf: &[u8], iv: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// A read view over the kernelcache Mach-O: outer segments for address<->offset, the prelink info, and the kext Mach-O's
-/// own __text. Kept small and local to the patch; the shared macho.rs reads commands, not segment maps.
-struct Image<'a> {
+/// own __text. The shared macho.rs reads commands, not segment maps.
+pub(crate) struct Image<'a> {
     bytes: &'a [u8],
     // (vmaddr, vmsize, fileoff, filesize) per outer LC_SEGMENT.
     segs: Vec<(u32, u32, u32, u32)>,
@@ -278,7 +264,7 @@ struct Image<'a> {
 }
 
 impl<'a> Image<'a> {
-    fn new(b: &'a [u8]) -> std::result::Result<Image<'a>, PatchError> {
+    pub(crate) fn new(b: &'a [u8]) -> std::result::Result<Image<'a>, PatchError> {
         if b.len() < 28 || le32(b, 0) != 0xFEED_FACE || le32(b, 4) != 12 {
             return Err(PatchError::NotMachO);
         }
@@ -326,7 +312,7 @@ impl<'a> Image<'a> {
             .map(|&(vmaddr, _, fileoff, _)| (fileoff.wrapping_add(a.wrapping_sub(vmaddr))) as usize)
     }
 
-    fn off_to_addr(&self, o: usize) -> Option<u32> {
+    pub(crate) fn off_to_addr(&self, o: usize) -> Option<u32> {
         self.segs
             .iter()
             .find(|&&(_, _, fileoff, filesize)| o >= fileoff as usize && o < fileoff.wrapping_add(filesize) as usize)
@@ -456,13 +442,6 @@ mod tests {
         let kernel = prelinked_kernel(info);
         let img = Image::new(&kernel).unwrap();
         assert_eq!(img.sandbox_kext_load_addr(), Some(0x805f1000));
-    }
-
-    #[test]
-    fn literal_lzss_round_trips() {
-        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
-        let stream = literal_lzss(&data);
-        assert_eq!(crate::lzss::decompress(&stream, 0x20), data);
     }
 
     #[test]

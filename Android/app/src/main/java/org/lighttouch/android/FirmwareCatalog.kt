@@ -34,8 +34,7 @@ internal data class CatalogFirmware(
      */
     val jailbreakUnavailable: String? get() = when {
         (version.substringBefore('.').toIntOrNull() ?: 0) < 2 -> "Needs iPhone OS 2.0 or later"
-        // Substrate's launchd hook (cynject from /etc/launchd.conf) hangs every boot after the first: docs/TODO.md.
-        board == "n72ap" -> "Not on iPod touch 2G yet: it wouldn't start up again after its first restart"
+        board == "n72ap" && id != "n72ap-7E18" -> "Available on iPod touch 2G only with iOS 3.1.3"
         else -> null
     }
 }

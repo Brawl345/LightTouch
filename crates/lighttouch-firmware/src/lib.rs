@@ -56,6 +56,7 @@ pub mod n45_recipe;
 pub mod n45ftl;
 pub mod n45nand;
 pub mod n45nor;
+pub mod n72_jailbreak_patch;
 pub mod n72_recipe;
 pub mod n72keybag;
 pub mod n72nand;

@@ -41,6 +41,7 @@ const GUEST_TOOLS: [&str; 4] = ["it_agent", "it_typein.dylib", "sblaunch", "sbdl
 /// SpringBoard's first-run "Edit Home Screen" tip stays down once com.apple.springboard SBDidShowReorderText is true.
 const REORDER_TIP: &str = "SBDidShowReorderText";
 const KEYBAG_HELPER_BASE: &str = "it_keybag";
+const JAILBREAK_ID: &str = "n72ap-7E18";
 
 /// The -machine options every device this recipe builds boots with (the lock's "machine"). hardware: the AES mode
 /// register reads back, so iBoot's UID derivation encrypts, as n72nor wraps for.
@@ -120,6 +121,31 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
 
 pub(crate) fn file_record(c: &Context, name: &str) -> Result<Value> {
     Ok(json!({"path": name, "sha256": files::sha256_file(&c.file(name))?}))
+}
+
+fn rewrap_jailbreak_kernelcache(
+    raw: &[u8],
+    kernel: &[u8],
+    iv: &[u8],
+    key: &[u8],
+) -> Result<(Vec<u8>, Vec<crate::n72_jailbreak_patch::AppliedPatch>)> {
+    let (patched, report) = crate::n72_jailbreak_patch::apply(kernel)?;
+    let rewrapped = crate::sandbox_patch::rewrap(raw, &patched, iv, key)?;
+    let payload = img3::decrypt(&rewrapped, iv, key, false)?;
+    if crate::lzss::complzss(&payload)? != patched {
+        return Err(crate::internal!("N72 jailbreak kernelcache does not read back as the patched kernel"));
+    }
+    check_iboot_kernelcache_size(patched.len(), payload.len())?;
+    Ok((rewrapped, report))
+}
+
+/// iBoot 636.66.33 refuses a kernelcache whose uncompressed size plus DATA payload exceeds 15 MiB.
+fn check_iboot_kernelcache_size(uncompressed: usize, stored: usize) -> Result<()> {
+    const MAX: usize = 15 * 1024 * 1024;
+    if uncompressed + stored > MAX {
+        return Err(crate::internal!("N72 kernelcache needs {} bytes in iBoot, more than {MAX}", uncompressed + stored));
+    }
+    Ok(())
 }
 
 pub(crate) fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -500,6 +526,40 @@ impl N72Board {
         drop(fw);
         Ok((report, modes))
     }
+
+    fn jailbreak_iboot(&mut self, c: &Context, iboot: &[u8]) -> Result<Vec<u8>> {
+        let patched = crate::n72_jailbreak_patch::apply_iboot(iboot)?;
+        self.derived.insert("jailbreak_iboot_sha256".into(), json!(crate::n72_jailbreak_patch::IBOOT_PATCHED_SHA256));
+        c.log(&format!("N72 jailbreak iBoot patched: SHA-256 {}", crate::n72_jailbreak_patch::IBOOT_PATCHED_SHA256));
+        Ok(patched)
+    }
+
+    fn jailbreak_kernelcache(&mut self, c: &Context) -> Result<Vec<u8>> {
+        let raw = c.ipsw()?.read(&self.kc_member)?;
+        let kernel = read(&c.dec_file("kernelcache.mach")?)?;
+        let component = c.e().key_for_path(&self.kc_member)?;
+        let iv = component
+            .iv
+            .as_deref()
+            .and_then(crate::entry::from_hex)
+            .ok_or_else(|| Error::new(Code::KeyMissing, format!("{}: no IV for {}", c.e().id, component.file)))?;
+        let key = crate::entry::from_hex(&component.key)
+            .ok_or_else(|| Error::new(Code::KeyMissing, format!("{}: no key for {}", c.e().id, component.file)))?;
+        let (rewrapped, report) = rewrap_jailbreak_kernelcache(&raw, &kernel, &iv, &key)?;
+        let patches: Vec<Value> = report
+            .iter()
+            .map(|patch| json!({"name": patch.name, "address": format!("{:#010x}", patch.address)}))
+            .collect();
+        for patch in &report {
+            c.log(&format!("N72 jailbreak kernel patch: {} at {:#010x}", patch.name, patch.address));
+        }
+        c.log(&format!("N72 jailbreak kernelcache re-wrapped: SHA-256 {}", crate::n72_jailbreak_patch::PATCHED_SHA256));
+        self.derived.insert(
+            "jailbreak_kernel".into(),
+            json!({"sha256": crate::n72_jailbreak_patch::PATCHED_SHA256, "patches": patches}),
+        );
+        Ok(rewrapped)
+    }
 }
 
 impl Board for N72Board {
@@ -533,10 +593,11 @@ impl Board for N72Board {
     }
 
     fn check(&mut self, c: &mut Context) -> Result<()> {
-        // Cydia's first boot installs Substrate, whose launchd hook (cynject from /etc/launchd.conf) then hangs
-        // launchctl on every later boot of this machine (docs/TODO.md): no jailbreak on the 2G until that is solved.
-        if self.recipe.option("jailbreak") == Some(true) {
-            return Err(crate::unsupported!("{}: no jailbreak on the iPod touch 2G yet", c.e().id));
+        if self.recipe.option("jailbreak") == Some(true) && c.e().id != JAILBREAK_ID {
+            return Err(crate::unsupported!(
+                "{}: jailbreak on the iPod touch 2G is supported only for iOS 3.1.3 (7E18)",
+                c.e().id
+            ));
         }
         self.bootrom = bootrom_path(c.o.bootrom.as_deref(), &c.o.helper_path);
         if self.data_protection {
@@ -584,11 +645,15 @@ impl Board for N72Board {
 
     /// nor.bin, gid-blobs.bin, iBoot.bin (3.x+), and the derived facts the lock records.
     fn boot_files(&mut self, c: &mut Context) -> Result<()> {
-        let ident = self.ident.as_ref().ok_or_else(|| filled("the identity"))?;
         let e = c.e().clone();
         let ipsw = c.ipsw()?;
-        let iboot = read(&c.dec_file("iBoot.bin")?)?;
-        self.kc_path = kernelcache_path(&iboot)?;
+        let stock_iboot = read(&c.dec_file("iBoot.bin")?)?;
+        self.kc_path = kernelcache_path(&stock_iboot)?;
+        let iboot = if self.recipe.option("jailbreak") == Some(true) {
+            self.jailbreak_iboot(c, &stock_iboot)?
+        } else {
+            stock_iboot
+        };
         let components = crate::ipsw::build_components(&ipsw, &e.board)?;
         self.kc_member =
             components.get("KernelCache").cloned().ok_or_else(|| crate::unsupported!("{}: the IPSW names no KernelCache", e.id))?;
@@ -633,6 +698,7 @@ impl Board for N72Board {
         };
         self.derived.insert("nor_images".into(), json!(nor_types));
         self.derived.insert("wrap_shsh_types".into(), json!(wrap));
+        let ident = self.ident.as_ref().ok_or_else(|| filled("the identity"))?;
         let nor = n72nor::build(ident, &images, &nor_types, if major >= 3 { None } else { Some(&wrap) })?;
         std::fs::write(c.file("nor.bin"), nor)?;
         // Stock DFU/recovery also decrypts the restore ramdisks and boot images: their GID inputs, same table.
@@ -675,7 +741,12 @@ impl Board for N72Board {
         if let Some((dir, _)) = self.kc_path.rsplit_once('/') {
             ed.mkdirs(dir)?;
         }
-        ed.write(&self.kc_path, c.ipsw()?.read(&self.kc_member)?, None)?;
+        let kernelcache = if self.recipe.option("jailbreak") == Some(true) {
+            self.jailbreak_kernelcache(c)?
+        } else {
+            c.ipsw()?.read(&self.kc_member)?
+        };
+        ed.write(&self.kc_path, kernelcache, None)?;
         let (report, modes) = self.bake(&mut ed, c, &mut owners)?;
         system_edits::remove_junk(&mut ed)?;
         ed.commit()?;
@@ -764,5 +835,30 @@ mod tests {
         assert_eq!(iboot_version(d).as_deref(), Some("iBoot-636.66.33"));
         let ib = b"..\0/System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8720x\0../System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8720x\0";
         assert_eq!(kernelcache_path(ib).unwrap(), "System/Library/Caches/com.apple.kernelcaches/kernelcache.s5l8720x");
+    }
+
+    #[test]
+    fn iboot_kernelcache_limit() {
+        assert!(check_iboot_kernelcache_size(0x766000, 0x3c4490).is_ok());
+        assert!(check_iboot_kernelcache_size(0x766000, 0x852d80).unwrap_err().to_string().contains("16485760"));
+    }
+
+    #[test]
+    #[ignore = "set LTM_N72_7E18_IPSW and LTM_N72_7E18_KERNEL to the verified iPod2,1 3.1.3 inputs"]
+    fn rewraps_verified_n72_kernelcache() {
+        let ipsw_path = std::env::var("LTM_N72_7E18_IPSW").unwrap();
+        let kernel_path = std::env::var("LTM_N72_7E18_KERNEL").unwrap();
+        let catalog = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Portable/firmware/firmware-catalog.json");
+        let entry = crate::entry::Entry::load_from_catalog(&catalog, JAILBREAK_ID).unwrap();
+        let ipsw = crate::ipsw::Ipsw::open(Path::new(&ipsw_path)).unwrap();
+        let components = crate::ipsw::build_components(&ipsw, &entry.board).unwrap();
+        let member = components.get("KernelCache").unwrap();
+        let raw = ipsw.read(member).unwrap();
+        let component = entry.key_for_path(member).unwrap();
+        let iv = component.iv.as_deref().and_then(crate::entry::from_hex).unwrap();
+        let key = crate::entry::from_hex(&component.key).unwrap();
+        let kernel = std::fs::read(kernel_path).unwrap();
+        let (_, report) = rewrap_jailbreak_kernelcache(&raw, &kernel, &iv, &key).unwrap();
+        assert_eq!(report.len(), 10);
     }
 }
