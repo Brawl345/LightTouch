@@ -14,6 +14,11 @@
 //! http, as 3.x's TLS can't reach its repositories. Patcyh, which freeze.tar carries for iOS 8.3 and later, comes
 //! out, as Legacy iOS Kit takes it out below 8.3: with Substrate it would load into installd beside AppSync.
 //!
+//! Melder, a faster package manager beside Cydia, is the current com.koutsie.melder from koutsie's repo, checked
+//! against the SHA-256 its Packages index lists (the repo keeps only its latest builds, so no version is pinned). Its
+//! .deb goes into the same AutoInstall folder, so dpkg installs it on the first boot and its postinst makes its root
+//! helper set-user-ID.
+//!
 //! Cydia's default sources are seeded as its own migration reads them (/var/lib/cydia/metadata.plist, Version 1, so
 //! its first launch adds none of its own): BigBoss, and ModMyi and ZodTTD at the archives SaurikIT serves them from
 //! now, where Cydia 1.1.30 would add hosts that no longer answer and each refresh would fail on them.
@@ -61,6 +66,11 @@ pub const FILES: [(&str, &str); 3] = [
     ("cydiahttpatch.tar", "3a1302c6294fe290c6d52186dd4fe56cda7fd661"),
 ];
 pub const NAME: &str = FILES[0].0;
+pub const MELDER_REPO: &str = "https://repo.k0.tel/";
+pub const MELDER_PACKAGE: &str = "com.koutsie.melder";
+/// Melder's .deb in the bootstrap folder and in AutoInstall.
+pub const MELDER: &str = "com.koutsie.melder.deb";
+pub const AUTO_INSTALL: &str = "private/var/root/Media/Cydia/AutoInstall";
 pub const NO_STASH: &str = ".cydia_no_stash";
 pub const METADATA: &str = "private/var/lib/cydia/metadata.plist";
 /// What isn't extracted: the bootstrap's trust store.
@@ -99,24 +109,76 @@ pub fn bootstrap_with(dir: &Path, download: &dyn Fn(&str, &Path) -> Result<()>, 
     std::fs::create_dir_all(dir).map_err(|e| crate::internal!("{}: {e}", dir.display()))?;
     for (name, sha1) in FILES {
         let file = dir.join(name);
-        if file.is_file() && sha1_file(&file)? == sha1 {
+        if file.is_file() && digest_file::<Sha1>(&file)? == sha1 {
             continue;
         }
-        let url = format!("{SOURCE}{name}");
-        let part = dir.join(format!(".{name}.download"));
-        log(&format!("Cydia: {url}"));
-        let fetched = download(&url, &part).and_then(|()| {
-            let got = sha1_file(&part)?;
-            if got != sha1 {
-                return Err(Error::new(Code::ShaMismatch, format!("Cydia: {name} SHA-1 {got}, not {sha1}")));
-            }
-            let _ = std::fs::remove_file(&file);
-            std::fs::rename(&part, &file).map_err(|e| crate::internal!("{}: {e}", file.display()))
-        });
-        let _ = std::fs::remove_file(&part);
-        fetched?;
+        log(&format!("Cydia: {SOURCE}{name}"));
+        fetch(&format!("{SOURCE}{name}"), &file, sha1, digest_file::<Sha1>, download)?;
+    }
+    let melder = dir.join(MELDER);
+    if let Err(e) = latest_melder(dir, &melder, download, log) {
+        if !melder.is_file() {
+            return Err(e);
+        }
+        log(&format!("Melder: {e}; the cached {MELDER} is used"));
     }
     Ok(dir.join(NAME))
+}
+
+/// `url` into `file` when its digest (`hash`) is `want`; on any failure `file` is left as it was.
+fn fetch(
+    url: &str,
+    file: &Path,
+    want: &str,
+    hash: fn(&Path) -> Result<String>,
+    download: &dyn Fn(&str, &Path) -> Result<()>,
+) -> Result<()> {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let part = file.with_file_name(format!(".{name}.download"));
+    let fetched = download(url, &part).and_then(|()| {
+        let got = hash(&part)?;
+        if got != want {
+            return Err(Error::new(Code::ShaMismatch, format!("{name}: digest {got}, not {want}")));
+        }
+        let _ = std::fs::remove_file(file);
+        std::fs::rename(&part, file).map_err(|e| crate::internal!("{}: {e}", file.display()))
+    });
+    let _ = std::fs::remove_file(&part);
+    fetched
+}
+
+/// Melder's current .deb into `file`, as the repo's Packages index lists it.
+fn latest_melder(dir: &Path, file: &Path, download: &dyn Fn(&str, &Path) -> Result<()>, log: &dyn Fn(&str)) -> Result<()> {
+    let index = dir.join(".Packages.download");
+    let read = download(&format!("{MELDER_REPO}Packages"), &index)
+        .and_then(|()| std::fs::read_to_string(&index).map_err(|e| crate::internal!("{}: {e}", index.display())));
+    let _ = std::fs::remove_file(&index);
+    let (filename, sha256) = melder_entry(&read?)?;
+    if file.is_file() && digest_file::<sha2::Sha256>(file)? == sha256 {
+        return Ok(());
+    }
+    let url = format!("{MELDER_REPO}{filename}");
+    log(&format!("Melder: {url}"));
+    fetch(&url, file, &sha256, digest_file::<sha2::Sha256>, download)
+}
+
+/// Melder's Filename and SHA256 in a Packages index.
+pub fn melder_entry(index: &str) -> Result<(String, String)> {
+    let index = index.replace("\r\n", "\n");
+    let stanza = index
+        .split("\n\n")
+        .find(|s| s.lines().any(|l| l.trim_end() == format!("Package: {MELDER_PACKAGE}")))
+        .ok_or_else(|| crate::internal!("Melder: no {MELDER_PACKAGE} in {MELDER_REPO}Packages"))?;
+    let field = |key: &str| {
+        stanza.lines().find_map(|l| l.strip_prefix(key).and_then(|v| v.strip_prefix(':')).map(|v| v.trim().to_string()))
+    };
+    let filename = field("Filename").ok_or_else(|| crate::internal!("Melder: no Filename in its Packages entry"))?;
+    let sha256 = field("SHA256").map(|s| s.to_lowercase()).ok_or_else(|| crate::internal!("Melder: no SHA256 in its Packages entry"))?;
+    let safe = filename.split('/').all(|p| !p.is_empty() && p != "..") && !filename.contains(':') && !filename.contains('?');
+    if !safe || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(crate::unsupported!("Melder: Packages entry {filename} {sha256}"));
+    }
+    Ok((filename, sha256))
 }
 
 /// `url` into the file `to`, over HTTPS.
@@ -129,15 +191,15 @@ pub fn download(url: &str, to: &Path) -> Result<()> {
         .https_only(true)
         .build()
         .into();
-    let mut response = agent.get(url).call().map_err(|e| crate::internal!("Cydia: {url}: {e}"))?;
+    let mut response = agent.get(url).call().map_err(|e| crate::internal!("{url}: {e}"))?;
     let mut file = std::fs::File::create(to).map_err(|e| crate::internal!("{}: {e}", to.display()))?;
-    std::io::copy(&mut response.body_mut().as_reader(), &mut file).map_err(|e| crate::internal!("Cydia: {url}: {e}"))?;
+    std::io::copy(&mut response.body_mut().as_reader(), &mut file).map_err(|e| crate::internal!("{url}: {e}"))?;
     Ok(())
 }
 
-fn sha1_file(path: &Path) -> Result<String> {
+fn digest_file<D: Digest>(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path).map_err(|e| crate::internal!("{}: {e}", path.display()))?;
-    let mut h = Sha1::new();
+    let mut h = D::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
         let n = f.read(&mut buf).map_err(|e| crate::internal!("{}: {e}", path.display()))?;
@@ -399,6 +461,13 @@ pub fn install_cydia(system: &mut Editor, bootstrap: &Path) -> Result<Cydia> {
         }
         archives.push(members);
     }
+    let deb = std::fs::read(dir.join(MELDER)).map_err(|e| crate::internal!("Melder: {}: {e}", dir.join(MELDER).display()))?;
+    let mut root: Vec<String> = Path::new(AUTO_INSTALL)
+        .ancestors()
+        .map(|a| a.to_string_lossy().into_owned())
+        .filter(|a| !a.is_empty() && !exists(system, a) && !entries.contains(a))
+        .collect();
+    root.reverse();
     let added: HashSet<String> = entries.iter().filter(|e| !exists(system, e)).cloned().collect();
     for members in &archives {
         for m in members {
@@ -446,7 +515,10 @@ pub fn install_cydia(system: &mut Editor, bootstrap: &Path) -> Result<Cydia> {
     }
     let metadata = plistedit::dictionary([("Version", 1.into()), ("Sources", Value::Dictionary(sources))]);
     system.write(METADATA, plistedit::serialize(&Value::Dictionary(metadata), Format::Xml)?, Some(0o644))?;
-    let mut root = vec![NO_STASH.to_string(), METADATA.to_string()];
+    system.mkdirs(AUTO_INSTALL)?;
+    let melder = format!("{AUTO_INSTALL}/{MELDER}");
+    system.write(&melder, deb, Some(0o644))?;
+    root.extend([melder, NO_STASH.to_string(), METADATA.to_string()]);
     let mut mobile = Vec::new();
     for rel in &entries {
         if added.contains(rel) || is_link(system, rel) {
@@ -461,7 +533,7 @@ pub fn install_cydia(system: &mut Editor, bootstrap: &Path) -> Result<Cydia> {
         special.into_iter().filter(|(p, _)| added.contains(p) && !p.starts_with("private/var/")).collect();
     let name = bootstrap.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     Ok(Cydia {
-        line: format!("Cydia: {name}, {} of {} entries added", added.len(), entries.len()),
+        line: format!("Cydia: {name}, {} of {} entries added, Melder in AutoInstall", added.len(), entries.len()),
         root,
         mobile,
         modes,
@@ -627,6 +699,7 @@ mod tests {
             std::fs::write(dir.join(name), tar_of(&[("./", T::Directory, 0o755, b"", None), (rel, T::Regular, 0o644, name.as_bytes(), None)]))
                 .unwrap();
         }
+        std::fs::write(dir.join(MELDER), b"melder").unwrap();
         dir.join("freeze.tar.gz")
     }
 
@@ -753,6 +826,10 @@ mod tests {
                 assert_eq!(ed.exists(&format!("{auto}{deb}")), wanted, "{version}: {deb}");
                 assert_eq!(r.root.iter().any(|p| *p == format!("{auto}{deb}")), wanted, "{version}: {deb} is root's");
             }
+            let melder = format!("{auto}{MELDER}");
+            assert_eq!(ed.read(&melder).unwrap(), b"melder", "{version}: Melder");
+            assert!(r.root.iter().any(|p| *p == melder), "{version}: Melder is root's");
+            assert!(r.root.iter().any(|p| p == "private/var/root/Media"), "{version}: its new folders are root's");
             for rel in PATCYH {
                 assert!(!ed.exists(rel), "{version}: {rel} is gone");
                 assert!(!r.root.iter().any(|p| p == rel));
@@ -774,6 +851,48 @@ mod tests {
         let r = bootstrap_with(&dir.0, &|_, file| Ok(std::fs::write(file, b"not freeze.tar")?), &|_| {});
         assert!(matches!(r, Err(e) if e.code == Code::ShaMismatch));
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0, "nothing is left in the cache");
+    }
+
+    const INDEX: &str = "Package: com.koutsie.oldfetch\nFilename: debs/oldfetch.deb\nSHA256: 00\n\n\
+                         Package: com.koutsie.melder\nName: Melder\nFilename: debs/com.koutsie.melder_0.9.8+6_iphoneos-arm.deb\n\
+                         SHA256: A5424D9196773F133D74CFB0BC687D56DCBBF1BE296B3208E0C8342CBF86F366\n\n";
+
+    #[test]
+    fn melders_entry_in_the_index() {
+        let (file, sha) = melder_entry(INDEX).unwrap();
+        assert_eq!(file, "debs/com.koutsie.melder_0.9.8+6_iphoneos-arm.deb");
+        assert_eq!(sha, "a5424d9196773f133d74cfb0bc687d56dcbbf1be296b3208e0c8342cbf86f366");
+        assert!(melder_entry(&INDEX.replace("debs/com.koutsie", "../com.koutsie")).is_err());
+        assert!(melder_entry(&INDEX.replace("debs/com.koutsie", "https://evil/com.koutsie")).is_err());
+        assert!(melder_entry("Package: com.koutsie.melderx\n").is_err());
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(data))
+    }
+
+    /// The latest Melder is downloaded against the index's SHA-256; offline, the cached one stays.
+    #[test]
+    fn melder_follows_the_index() {
+        let dir = TempDir::new("melder");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let file = dir.0.join(MELDER);
+        let index = format!("Package: {MELDER_PACKAGE}\nFilename: debs/m.deb\nSHA256: {}\n", sha256_hex(b"new"));
+        let online = |url: &str, to: &Path| -> Result<()> {
+            let body: &[u8] = if url.ends_with("Packages") { index.as_bytes() } else { b"new" };
+            assert!(url == format!("{MELDER_REPO}Packages") || url == format!("{MELDER_REPO}debs/m.deb"), "{url}");
+            Ok(std::fs::write(to, body)?)
+        };
+        std::fs::write(&file, b"old").unwrap();
+        latest_melder(&dir.0, &file, &online, &|_| {}).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        let tampered = |url: &str, to: &Path| -> Result<()> {
+            Ok(std::fs::write(to, if url.ends_with("Packages") { index.as_bytes() } else { b"other" })?)
+        };
+        std::fs::write(&file, b"old").unwrap();
+        assert!(matches!(latest_melder(&dir.0, &file, &tampered, &|_| {}), Err(e) if e.code == Code::ShaMismatch));
+        assert_eq!(std::fs::read(&file).unwrap(), b"old", "a mismatch keeps the cached file");
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1, "no partial files are left");
     }
 
     /// The typein option: it_typein out of SpringBoard's DYLD_INSERT_LIBRARIES, in as a Substrate extension.

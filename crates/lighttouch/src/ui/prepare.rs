@@ -360,7 +360,7 @@ fn files_step(app: &mut App, ui: &mut Ui) {
             &p,
             icons::BAG,
             "Jailbreak",
-            unavailable.unwrap_or("Cydia and afc2, installed during preparation"),
+            unavailable.unwrap_or("Cydia, Melder and afc2, installed during preparation"),
             |ui| {
                 ui.add_enabled_ui(unavailable.is_none(), |ui| widgets::switch(ui, &p, &mut app.prepare.jailbreak));
             },
